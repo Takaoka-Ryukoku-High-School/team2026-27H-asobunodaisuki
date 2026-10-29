@@ -1,11 +1,16 @@
+import calendar
+from contextlib import closing
 import json
+import sqlite3
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
 import flet as ft
 
 
-DATA_FILE = Path.home() / ".daily_note_tasks.json"
+DATABASE_FILE = Path.home() / ".daily_note_tasks.sqlite3"
+LEGACY_DATA_FILE = Path.home() / ".daily_note_tasks.json"
 GREEN = "#2E6654"
 GREEN_LIGHT = "#E2EDE5"
 PAPER = "#F6F5EF"
@@ -14,28 +19,105 @@ MUTED = "#77807B"
 CORAL = "#CF6048"
 
 
+def initialize_storage():
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=10)) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    done INTEGER NOT NULL,
+                    date TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS app_metadata (key TEXT PRIMARY KEY)"
+            )
+            migrated = connection.execute(
+                "SELECT 1 FROM app_metadata WHERE key = 'legacy_json_migrated'"
+            ).fetchone()
+            if migrated:
+                return
+
+            try:
+                legacy_tasks = json.loads(LEGACY_DATA_FILE.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                legacy_tasks = []
+
+            records = []
+            if isinstance(legacy_tasks, list):
+                for task in reversed(legacy_tasks):
+                    if not (
+                        isinstance(task, dict)
+                        and isinstance(task.get("id"), str)
+                        and isinstance(task.get("text"), str)
+                        and isinstance(task.get("done"), bool)
+                    ):
+                        continue
+                    try:
+                        task_date = date.fromisoformat(task.get("date", ""))
+                    except (TypeError, ValueError):
+                        task_date = date.today()
+                    records.append(
+                        (task["id"], task["text"], int(task["done"]), task_date.isoformat())
+                    )
+
+            connection.executemany(
+                "INSERT OR IGNORE INTO tasks (id, text, done, date) VALUES (?, ?, ?, ?)",
+                records,
+            )
+            connection.execute(
+                "INSERT INTO app_metadata (key) VALUES ('legacy_json_migrated')"
+            )
+
+
 def load_tasks():
-    try:
-        tasks = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        if isinstance(tasks, list):
-            return [
-                task
-                for task in tasks
-                if isinstance(task, dict)
-                and isinstance(task.get("id"), str)
-                and isinstance(task.get("text"), str)
-                and isinstance(task.get("done"), bool)
-            ]
-    except (OSError, json.JSONDecodeError):
-        pass
-    return []
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=10)) as connection:
+        rows = connection.execute(
+            "SELECT id, text, done, date FROM tasks ORDER BY rowid DESC"
+        ).fetchall()
+    return [
+        {"id": task_id, "text": text, "done": bool(done), "date": task_date}
+        for task_id, text, done, task_date in rows
+    ]
 
 
-def save_tasks(tasks):
-    DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+def insert_task_record(task):
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=10)) as connection:
+        with connection:
+            connection.execute(
+                "INSERT INTO tasks (id, text, done, date) VALUES (?, ?, ?, ?)",
+                (task["id"], task["text"], int(task["done"]), task["date"]),
+            )
+
+
+def toggle_task_record(task_id):
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=10)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE tasks SET done = 1 - done WHERE id = ?", (task_id,)
+            )
+
+
+def delete_task_record(task_id):
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=10)) as connection:
+        with connection:
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+
+
+def delete_completed_records(task_date):
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=10)) as connection:
+        with connection:
+            connection.execute(
+                "DELETE FROM tasks WHERE date = ? AND done = 1", (task_date,)
+            )
 
 
 def main(page: ft.Page):
+    initialize_storage()
     page.title = "今日の段取り | ToDo"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.bgcolor = PAPER
@@ -45,9 +127,10 @@ def main(page: ft.Page):
 
     tasks = load_tasks()
     current_filter = "all"
+    selected_date = date.today()
 
     task_input = ft.TextField(
-        hint_text="次にやることは？",
+        hint_text="この日にすることは？",
         expand=True,
         autofocus=True,
         border_radius=6,
@@ -60,20 +143,22 @@ def main(page: ft.Page):
     task_list = ft.Column(spacing=0)
     task_count = ft.Text(color=MUTED, size=12)
     progress_label = ft.Text(color=MUTED, size=11)
+    month_label = ft.Text(size=16, color=INK, weight=ft.FontWeight.W_600)
+    month_summary = ft.Text(color=MUTED, size=11)
+    selected_date_label = ft.Text(color=INK, size=13, weight=ft.FontWeight.W_600)
+    calendar_grid = ft.Column(spacing=4)
     clear_done_button = ft.TextButton(
-        "完了した項目を削除",
+        "この日の完了予定を削除",
         icon=ft.Icons.DELETE_OUTLINE,
         style=ft.ButtonStyle(color=CORAL),
         on_click=lambda event: clear_done(event),
     )
     filter_buttons = {}
 
-    def persist():
-        try:
-            save_tasks(tasks)
-            progress_label.value = f"{sum(task['done'] for task in tasks)} / {len(tasks)} 件 完了"
-        except OSError:
-            progress_label.value = "保存できませんでした。書き込み権限をご確認ください。"
+    def publish_updates():
+        tasks[:] = load_tasks()
+        render()
+        page.pubsub.send_others("shared-tasks-updated")
 
     def set_filter(value):
         nonlocal current_filter
@@ -81,47 +166,134 @@ def main(page: ft.Page):
         render()
 
     def add_task(event):
+        nonlocal current_filter
         text = task_input.value.strip()
         if not text:
             return
-        tasks.insert(0, {"id": str(uuid4()), "text": text, "done": False})
+        insert_task_record(
+            {
+                "id": str(uuid4()),
+                "text": text,
+                "done": False,
+                "date": selected_date.isoformat(),
+            }
+        )
         task_input.value = ""
-        persist()
-        set_filter("all")
+        current_filter = "all"
+        publish_updates()
+
+    def shift_month(offset):
+        nonlocal selected_date
+        month_index = selected_date.year * 12 + selected_date.month - 1 + offset
+        year, month_index = divmod(month_index, 12)
+        month = month_index + 1
+        day = min(selected_date.day, calendar.monthrange(year, month)[1])
+        selected_date = date(year, month, day)
+        render()
+
+    def select_date(value):
+        nonlocal selected_date
+        selected_date = value
+        render()
 
     def toggle_task(task_id):
-        for task in tasks:
-            if task["id"] == task_id:
-                task["done"] = not task["done"]
-                break
-        persist()
-        render()
+        toggle_task_record(task_id)
+        publish_updates()
 
     def delete_task(task_id):
-        tasks[:] = [task for task in tasks if task["id"] != task_id]
-        persist()
-        render()
+        delete_task_record(task_id)
+        publish_updates()
 
     def clear_done(event):
-        tasks[:] = [task for task in tasks if not task["done"]]
-        persist()
-        render()
+        delete_completed_records(selected_date.isoformat())
+        publish_updates()
 
     def render():
+        month_key = selected_date.strftime("%Y-%m")
+        month_tasks = [task for task in tasks if task["date"].startswith(month_key)]
+        selected_day = selected_date.isoformat()
+        day_tasks = [task for task in month_tasks if task["date"] == selected_day]
         visible_tasks = [
             task
-            for task in tasks
-            if current_filter == "all"
-            or (current_filter == "active" and not task["done"])
-            or (current_filter == "done" and task["done"])
+            for task in day_tasks
+            if (
+                current_filter == "all"
+                or (current_filter == "active" and not task["done"])
+                or (current_filter == "done" and task["done"])
+            )
         ]
-        remaining = sum(not task["done"] for task in tasks)
-        completed = len(tasks) - remaining
+        remaining = sum(not task["done"] for task in day_tasks)
+        completed = sum(task["done"] for task in month_tasks)
+        month_label.value = selected_date.strftime("%Y年%m月")
+        month_summary.value = f"今月の予定 {len(month_tasks)} 件"
+        weekday = ["月", "火", "水", "木", "金", "土", "日"][selected_date.weekday()]
+        selected_date_label.value = f"{selected_date.month}月{selected_date.day}日 ({weekday}) の予定"
         task_count.value = f"未完了 {remaining} 件"
         progress_label.value = (
-            f"{completed} / {len(tasks)} 件 完了" if tasks else "タスクはまだありません"
+            f"今月 {completed} / {len(month_tasks)} 件 完了"
+            if month_tasks
+            else "この月の予定はまだありません"
         )
-        clear_done_button.visible = completed > 0
+        clear_done_button.visible = any(
+            task["date"] == selected_day and task["done"] for task in tasks
+        )
+
+        weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+        calendar_rows = [
+            ft.Row(
+                [
+                    ft.Container(
+                        content=ft.Text(day, size=10, color=MUTED, text_align=ft.TextAlign.CENTER),
+                        expand=1,
+                        alignment=ft.Alignment.CENTER,
+                    )
+                    for day in weekdays
+                ],
+                spacing=4,
+            )
+        ]
+        first_weekday, days_in_month = calendar.monthrange(
+            selected_date.year, selected_date.month
+        )
+        cells = [None] * first_weekday + list(range(1, days_in_month + 1))
+        cells.extend([None] * ((-len(cells)) % 7))
+        for start in range(0, len(cells), 7):
+            week = []
+            for day in cells[start : start + 7]:
+                if day is None:
+                    week.append(ft.Container(expand=1, height=48))
+                    continue
+                cell_date = date(selected_date.year, selected_date.month, day)
+                day_count = sum(task["date"] == cell_date.isoformat() for task in tasks)
+                is_selected = cell_date == selected_date
+                week.append(
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    str(day),
+                                    size=12,
+                                    color=GREEN if is_selected else INK,
+                                    weight=ft.FontWeight.BOLD if is_selected else None,
+                                ),
+                                ft.Text(f"{day_count}件" if day_count else " ", size=9, color=MUTED),
+                            ],
+                            spacing=0,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                        ),
+                        expand=1,
+                        height=48,
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor=GREEN_LIGHT if is_selected else "#FFFEFA",
+                        border=ft.Border.all(1, GREEN if is_selected else "#E3E3D9"),
+                        border_radius=4,
+                        on_click=lambda event, value=cell_date: select_date(value),
+                        tooltip=cell_date.strftime("%-m月%-d日"),
+                    )
+                )
+            calendar_rows.append(ft.Row(week, spacing=4))
+        calendar_grid.controls = calendar_rows
 
         for key, button in filter_buttons.items():
             selected = key == current_filter
@@ -160,11 +332,11 @@ def main(page: ft.Page):
 
         if not visible_tasks:
             empty_text = (
-                "未完了のタスクはありません。いい調子！"
-                if current_filter == "active" and tasks
+                "未完了の予定はありません。いい調子！"
+                if current_filter == "active" and day_tasks
                 else "完了したタスクはまだありません。"
-                if current_filter == "done" and tasks
-                else "まずは、やることをひとつ書いてみましょう。"
+                if current_filter == "done" and day_tasks
+                else "この日にする予定を追加しましょう。"
             )
             rows = [
                 ft.Container(
@@ -184,6 +356,12 @@ def main(page: ft.Page):
         task_list.controls = rows
         page.update()
 
+    def on_shared_update(message):
+        if message != "shared-tasks-updated":
+            return
+        tasks[:] = load_tasks()
+        render()
+
     for key, label in (("all", "すべて"), ("active", "未完了"), ("done", "完了")):
         filter_buttons[key] = ft.TextButton(
             label,
@@ -191,7 +369,7 @@ def main(page: ft.Page):
         )
 
     today = ft.Text(
-        __import__("datetime").date.today().strftime("%Y年%m月%d日"),
+        date.today().strftime("%Y年%m月%d日"),
         size=12,
         color=MUTED,
     )
@@ -242,7 +420,44 @@ def main(page: ft.Page):
             ft.Container(
                 content=ft.Column(
                     [
-                        ft.Container(content=composer, padding=18, bgcolor=GREEN_LIGHT),
+                                ft.Row(
+                                    [
+                                        ft.IconButton(
+                                            ft.Icons.CHEVRON_LEFT,
+                                            tooltip="前の月",
+                                            on_click=lambda event: shift_month(-1),
+                                        ),
+                                        month_label,
+                                        ft.IconButton(
+                                            ft.Icons.CHEVRON_RIGHT,
+                                            tooltip="次の月",
+                                            on_click=lambda event: shift_month(1),
+                                        ),
+                                    ],
+                                    alignment=ft.MainAxisAlignment.CENTER,
+                                    spacing=8,
+                                ),
+                                calendar_grid,
+                                month_summary,
+                            ],
+                            spacing=8,
+                        ),
+                        padding=ft.Padding(left=18, right=18, top=12, bottom=12),
+                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                selected_date_label,
+                                composer,
+                            ],
+                            spacing=8,
+                        ),
+                        padding=18,
+                        bgcolor=GREEN_LIGHT,
+                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            [
                         ft.Container(
                             content=ft.Row(
                                 [ft.Row(list(filter_buttons.values()), spacing=0), task_count],
@@ -262,7 +477,7 @@ def main(page: ft.Page):
                             border=ft.Border.only(top=ft.BorderSide(1, "#DEDFD5")),
                         ),
                     ],
-                    spacing=0,
+                            spacing=0,
                 ),
                 width=700,
                 bgcolor="#FFFEFA",
@@ -290,6 +505,7 @@ def main(page: ft.Page):
 
     page.on_resize = resize_page
     page.add(app_container)
+    page.pubsub.subscribe(on_shared_update)
     render()
 
 
