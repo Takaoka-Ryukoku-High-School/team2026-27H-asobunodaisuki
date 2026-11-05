@@ -266,6 +266,7 @@ def main(page: ft.Page):
                 cell_date = date(selected_date.year, selected_date.month, day)
                 day_count = sum(task["date"] == cell_date.isoformat() for task in tasks)
                 is_selected = cell_date == selected_date
+                is_empty = day_count == 0
                 week.append(
                     ft.Container(
                         content=ft.Column(
@@ -285,7 +286,7 @@ def main(page: ft.Page):
                         expand=1,
                         height=48,
                         alignment=ft.Alignment.CENTER,
-                        bgcolor=GREEN_LIGHT if is_selected else "#FFFEFA",
+                        bgcolor=GREEN_LIGHT if is_selected else "#F2EBD9" if is_empty else "#FFFEFA",
                         border=ft.Border.all(1, GREEN if is_selected else "#E3E3D9"),
                         border_radius=4,
                         on_click=lambda event, value=cell_date: select_date(value),
